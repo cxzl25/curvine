@@ -451,14 +451,12 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .delete(&cv_path, false)
                 .await
                 .map_err(|e| fs_error_to_object_store(location, e)),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_missing_fs_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(location, e)),
         };
         let _ = self.release_object_write_lock(&lock).await;
         result?;
-        if !self.is_root_workspace() {
+        if !is_known_internal_dir(&cv_path) {
             let _ = self.prune_empty_parents(&cv_path, location).await;
         }
         Ok(())
@@ -1042,12 +1040,7 @@ impl CurvineObjectStore {
     ) -> OsResult<Vec<FileStatus>> {
         match self.context.fs.list_status(dir).await {
             Ok(entries) => Ok(entries),
-            Err(e)
-                if matches!(
-                    &e,
-                    FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
-                ) =>
-            {
+            Err(e) if is_missing_fs_error(&e) => {
                 Ok(Vec::new())
             }
             Err(e) => Err(fs_error_to_object_store(err_location, e)),
@@ -1145,9 +1138,7 @@ impl CurvineObjectStore {
         let dir = self.multipart_dir(location, upload_id)?;
         match self.context.fs.delete(&dir, true).await {
             Ok(_) => Ok(()),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_missing_fs_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(&Path::default(), e)),
         }
     }
@@ -1165,9 +1156,7 @@ impl CurvineObjectStore {
                 });
             }
             Ok(_) => {}
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => {}
+            Err(e) if is_missing_fs_error(&e) => {}
             Err(e) => return Err(fs_error_to_object_store(location, e)),
         }
 
@@ -1203,6 +1192,17 @@ impl CurvineObjectStore {
             if full_path.is_empty() || full_path == "/" || full_path == workspace_root {
                 break;
             }
+            if self.is_root_workspace()
+                && dir
+                    .parent()
+                    .map_err(|e| OsError::Generic {
+                        store: CURVINE_SCHEME,
+                        source: e.to_string().into(),
+                    })?
+                    .is_some_and(|p| p.is_root())
+            {
+                break;
+            }
             if !full_path.starts_with(&format!("{workspace_root}/")) {
                 break;
             }
@@ -1214,10 +1214,8 @@ impl CurvineObjectStore {
                         source: e.to_string().into(),
                     })?;
                 }
-                Err(FsError::DirNotEmpty(_))
-                | Err(FsError::FileNotFound(_))
-                | Err(FsError::Expired(_))
-                | Err(FsError::JobNotFound(_)) => break,
+                Err(FsError::DirNotEmpty(_)) => break,
+                Err(e) if is_missing_fs_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
             }
         }
@@ -1626,14 +1624,28 @@ fn multipart_staging_id(workspace_root: &CurvinePath, location: Option<&Path>) -
     format!("{:x}", hasher.finalize())
 }
 
+fn is_missing_fs_error(error: &FsError) -> bool {
+    if matches!(
+        error,
+        FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
+    ) {
+        return true;
+    }
+
+    // Some Curvine RPC paths surface missing targets as Common("... not exists").
+    let msg = error.to_string().to_ascii_lowercase();
+    msg.contains("not exists") || msg.contains("not exist") || msg.contains("not found")
+}
+
 fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
+    if is_missing_fs_error(&error) {
+        return OsError::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        };
+    }
+
     match error {
-        e @ FsError::FileNotFound(_) | e @ FsError::Expired(_) | e @ FsError::JobNotFound(_) => {
-            OsError::NotFound {
-                path: location.to_string(),
-                source: Box::new(e),
-            }
-        }
         e @ FsError::FileAlreadyExists(_) => OsError::AlreadyExists {
             path: location.to_string(),
             source: Box::new(e),
