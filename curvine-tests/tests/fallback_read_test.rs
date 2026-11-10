@@ -224,12 +224,7 @@ async fn build_reader_with_unreachable_worker(
         .await
         .unwrap()
         .unwrap();
-    FallbackFsReader::new(
-        cv_reader,
-        ufs_path,
-        mount.ufs().unwrap(),
-        mount.info.is_fs_mode(),
-    )
+    FallbackFsReader::new(cv_reader, ufs_path, mount)
 }
 
 // ---- TC-10: FsMode open returns Fallback -----------------------------------

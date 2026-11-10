@@ -497,7 +497,7 @@ impl UnifiedFileSystem {
         &self,
         cv_path: &Path,
         ufs_path: &Path,
-        mount: &MountValue,
+        mount: &Arc<MountValue>,
     ) -> FsResult<Option<FallbackFsReader>> {
         let mut blocks = match self.cv.get_block_locations(cv_path).await {
             Ok(blocks) => blocks,
@@ -515,8 +515,7 @@ impl UnifiedFileSystem {
                 Ok(Some(FallbackFsReader::new(
                     cv_reader,
                     ufs_path.clone(),
-                    mount.ufs()?,
-                    mount.info.is_fs_mode(),
+                    mount.clone(),
                 )))
             } else if blocks.ufs_exists() {
                 Ok(None)
@@ -534,8 +533,7 @@ impl UnifiedFileSystem {
                     Ok(Some(FallbackFsReader::new(
                         cv_reader,
                         ufs_path.clone(),
-                        mount.ufs()?,
-                        mount.info.is_fs_mode(),
+                        mount.clone(),
                     )))
                 }
                 CacheValidity::Invalid(_) => Ok(None),

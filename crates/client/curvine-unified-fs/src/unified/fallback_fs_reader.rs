@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{UfsFileSystem, UfsReader};
+use crate::{MountValue, UfsReader};
 use curvine_client_core::file::FsReader;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
@@ -21,6 +21,7 @@ use curvine_fs_api::{FileSystem, Path, Reader};
 use curvine_io::DataSlice;
 use curvine_model::{FileBlocks, FileStatus};
 use log::warn;
+use std::sync::Arc;
 
 /// A wrapper around `FsReader` that transparently falls back to UFS when Curvine
 /// becomes unavailable (master down at open time handled externally, worker down
@@ -30,6 +31,12 @@ use log::warn;
 /// - `cv_reader` is always present and maintains all internal state (pos, chunk, etc.).
 /// - `ufs_reader` is created lazily on the first worker failure; once set, all
 ///   subsequent reads go through UFS (no retry back to Curvine).
+/// - The UFS client itself is also resolved lazily (`mount.ufs()`), only when a fallback
+///   actually happens. A cache hit must not depend on this client being constructible:
+///   a client built without the mount's UFS backend (e.g. a Java SDK without HDFS
+///   support) or one that cannot create it in-process (JNI HDFS inside a host JVM)
+///   still serves cached data, and callers such as the Hadoop proxy filesystems
+///   handle UFS fallback on their own side.
 /// - Before falling back, consistency handling depends on the mount's write type:
 ///   - **FsMode** (Curvine is the authority, UFS is a flushed copy): `validate_ufs_consistency`
 ///     ensures the UFS data matches the snapshot recorded in Curvine metadata
@@ -48,24 +55,21 @@ pub struct FallbackFsReader {
     /// UnifiedReader::Fallback(FallbackFsReader) -> UfsReader (no Fallback variant).
     ufs_reader: Option<UfsReader>,
     ufs_path: Path,
-    ufs_fs: UfsFileSystem,
+    /// Source of the UFS client; `MountValue::ufs()` builds it once, on first fallback.
+    mount: Arc<MountValue>,
     /// True when the mount is FsMode. Controls whether the snapshot consistency check
     /// gates the fallback to UFS. CacheMode (false) reads S3 directly without validation.
     is_fs_mode: bool,
 }
 
 impl FallbackFsReader {
-    pub fn new(
-        cv_reader: FsReader,
-        ufs_path: Path,
-        ufs_fs: UfsFileSystem,
-        is_fs_mode: bool,
-    ) -> Self {
+    pub fn new(cv_reader: FsReader, ufs_path: Path, mount: Arc<MountValue>) -> Self {
+        let is_fs_mode = mount.info.is_fs_mode();
         Self {
             cv_reader,
             ufs_reader: None,
             ufs_path,
-            ufs_fs,
+            mount,
             is_fs_mode,
         }
     }
@@ -79,7 +83,7 @@ impl FallbackFsReader {
     /// Returns an error if UFS data cannot be trusted (modified externally or never flushed).
     async fn validate_ufs_consistency(&self) -> FsResult<()> {
         let cv_status = self.cv_reader.status();
-        let ufs_status = self.ufs_fs.get_status(&self.ufs_path).await?;
+        let ufs_status = self.mount.ufs()?.get_status(&self.ufs_path).await?;
 
         if !cv_status.ufs_valid(&ufs_status) {
             return err_box!(
@@ -202,7 +206,7 @@ impl Reader for FallbackFsReader {
                     self.validate_ufs_consistency().await?;
                 }
 
-                let mut ufs: UfsReader = self.ufs_fs.open_ufs(&self.ufs_path).await?;
+                let mut ufs: UfsReader = self.mount.ufs()?.open_ufs(&self.ufs_path).await?;
                 ufs.seek(pos).await?;
                 let data = ufs.read_chunk0().await?;
                 self.ufs_reader = Some(ufs);
